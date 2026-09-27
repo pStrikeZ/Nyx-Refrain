@@ -67,10 +67,70 @@ jobs:
       - name: Build
         run: ./scripts/build.sh
 
+      # One artifact per architecture: its binaries and license files, its installer or
+      # distro packages, and a SHA256SUMS covering just those files.
+      - name: Stage per-architecture artifacts
+        id: stage
+        run: |
+          shopt -s nullglob
+          # The version string baked into the binaries, e.g. v0.9.1 or v0.9.1-g1a2b3c4.
+          version="$(dist/linux-x86_64/nyxr --version | awk '{print $2}')"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          declare -A packages=(
+            [win32-amd64]="*-windows-x86_64-setup.exe"
+            [win32-aarch64]="*-windows-arm64-setup.exe"
+            [linux-x86_64]="*_amd64.deb *.x86_64.rpm *-x86_64.pkg.tar.zst"
+            [linux-aarch64]="*_arm64.deb *.aarch64.rpm *-aarch64.pkg.tar.zst"
+            [linux-loongarch64]="*_loong64.deb *.loongarch64.rpm *-loong64.pkg.tar.zst"
+          )
+          for arch in "${!packages[@]}"; do
+            out="staging/${arch}"
+            mkdir -p "${out}"
+            cp -a "dist/${arch}/." "${out}/"
+            matched=0
+            read -ra patterns <<< "${packages[${arch}]}"  # split without glob expansion
+            for pattern in "${patterns[@]}"; do
+              for f in dist/packages/${pattern}; do
+                cp -a "${f}" "${out}/"
+                matched=$((matched + 1))
+              done
+            done
+            if [[ "${matched}" -eq 0 ]]; then
+              echo "::error::no packages found for ${arch}"
+              exit 1
+            fi
+            (cd "${out}" && sha256sum -- * > SHA256SUMS)
+            echo "${arch}:"; ls -l "${out}"
+          done
+
       - uses: actions/upload-artifact@v4
         with:
-          name: nyx-refrain-${{ github.sha }}
-          path: dist/
+          name: nyx-refrain-${{ steps.stage.outputs.version }}-win32-amd64
+          path: staging/win32-amd64/
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nyx-refrain-${{ steps.stage.outputs.version }}-win32-aarch64
+          path: staging/win32-aarch64/
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nyx-refrain-${{ steps.stage.outputs.version }}-linux-x86_64
+          path: staging/linux-x86_64/
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nyx-refrain-${{ steps.stage.outputs.version }}-linux-aarch64
+          path: staging/linux-aarch64/
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nyx-refrain-${{ steps.stage.outputs.version }}-linux-loongarch64
+          path: staging/linux-loongarch64/
           if-no-files-found: error
 
   release:
@@ -80,9 +140,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Each artifact lands in dist/<artifact name>/.
       - uses: actions/download-artifact@v4
         with:
-          name: nyx-refrain-${{ github.sha }}
+          pattern: nyx-refrain-*
           path: dist
 
       # Draft only: the release is published by hand after a look at it.
@@ -90,8 +151,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cd dist/packages
+          mkdir release
+          find dist -type f \( -name '*-setup.exe' -o -name '*.deb' -o -name '*.rpm' -o -name '*.pkg.tar.zst' \) \
+            -exec cp -t release {} +
+          cd release
           sha256sum -- * > SHA256SUMS
+          ls -l
           gh release create "${GITHUB_REF_NAME}" ./* \
             --repo "${GITHUB_REPOSITORY}" \
             --title "Nyx Refrain ${GITHUB_REF_NAME#v}" \
