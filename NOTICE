@@ -1,0 +1,14 @@
+Nyx Refrain includes the Milky Way and Shooting Star 3D icons and the Shooting
+Star Color (vector) artwork from Microsoft Fluent Emoji, copyright (c) Microsoft
+Corporation, under the MIT License.
+
+Upstream: https://github.com/microsoft/fluentui-emoji
+Source revision: 1ffb34c752ecf5d402f04cfb4b392c77f57c54bc
+Source files: assets/Milky way/3D/milky_way_3d.png
+              assets/Shooting star/3D/shooting_star_3d.png
+              assets/Shooting star/Color/shooting_star_color.svg
+
+The application and tray icons in assets/icons/ (resized, some with yellow/red
+status badges) and the AirPlay placeholder cover
+assets/artwork/placeholder-cover.jpg are derived from these files. The full
+upstream license is included in LICENSE-fluentui-emoji.

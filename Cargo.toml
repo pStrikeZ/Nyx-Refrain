@@ -1,0 +1,96 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pwnative",
+    "crates/raop",
+    "crates/discovery",
+    "crates/netutil",
+    "crates/pipeline",
+    "crates/capture",
+    "crates/nowplaying",
+    "apps/nyxr",
+    "apps/nyx-refrain",
+]
+exclude = ["fuzz"]
+
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[workspace.package]
+version = "0.9.1"
+edition = "2024"
+license = "MIT"
+authors = ["pStrikeZ"]
+publish = false
+
+[workspace.dependencies]
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.5", features = ["derive"] }
+windows = { version = "0.58", features = [
+    "implement",
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_System_Com",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_Security",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_UI_Shell",
+    "Win32_System_Registry",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
+    "Win32_Globalization",
+    "Win32_Graphics_Dwm",
+    "Media_Control",
+    "Foundation",
+    "Storage_Streams",
+    "Win32_System_SystemInformation",
+] }
+socket2 = "0.6"
+libc = "0.2"
+hound = "3.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+unicode-normalization = "0.1"
+tokio = { version = "1.43", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
+rtrb = "0.3"
+base64 = "0.22"
+rand = "0.8"
+num-bigint = "0.4"
+sha2 = "0.10"
+hkdf = "0.12"
+chacha20poly1305 = "0.10"
+plist = "1"
+
+[profile.dev.package.rubato]
+opt-level = 3
+
+[profile.dev.package.rustfft]
+opt-level = 3
+
+[profile.dev.package.pipeline]
+opt-level = 3
+
+[profile.test]
+opt-level = 2
+
+
+[profile.release]
+strip = "symbols"
+# The zig-linked x86_64-pc-windows-gnu build keeps unused code (≈2x .text vs aarch64);
+# fat LTO drops it at the LLVM level: GUI 25.5 MB -> 12.9 MB, CLI 7.6 MB -> 3.7 MB.
+lto = "fat"
+codegen-units = 1

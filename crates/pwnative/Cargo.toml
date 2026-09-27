@@ -1,0 +1,13 @@
+[package]
+name = "pwnative"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+libc.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rtrb.workspace = true

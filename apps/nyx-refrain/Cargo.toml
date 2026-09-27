@@ -1,0 +1,43 @@
+[package]
+name = "nyx-refrain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Nyx Refrain tray / GUI front-end"
+build = "../../packaging/windows/build.rs"
+
+[[bin]]
+name = "nyx-refrain"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+raop = { path = "../../crates/raop" }
+capture = { path = "../../crates/capture" }
+pipeline = { path = "../../crates/pipeline" }
+discovery = { path = "../../crates/discovery" }
+netutil = { path = "../../crates/netutil" }
+nowplaying = { path = "../../crates/nowplaying" }
+tokio.workspace = true
+serde.workspace = true
+toml.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# CPU rendering via GDI: no GPU driver or graphics context, including on Windows on ARM.
+egui = "0.36"
+egui-winit = { version = "0.36", default-features = false, features = ["clipboard"] }
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+softbuffer = { version = "0.4", default-features = false }
+tray-icon = "0.25"
+windows = { workspace = true, features = ["Win32_Storage_FileSystem", "Win32_System_Memory"] }
+raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = "0.3.6"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+libc.workspace = true
+
+[dev-dependencies]
+# Exercise the platform-independent rasterizer in native Linux tests too.
+egui = "0.36"

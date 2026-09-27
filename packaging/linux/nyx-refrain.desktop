@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=Nyx Refrain
+Name[zh_CN]=Nyx Refrain
+GenericName=AirPlay Audio Sender
+GenericName[zh_CN]=AirPlay 音频发送器
+Comment=Stream system audio to AirPlay speakers from the system tray
+Comment[zh_CN]=通过系统托盘将系统音频推送到 AirPlay 音箱
+Exec=nyx-refrain
+Icon=nyx-refrain
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=AirPlay;HomePod;Audio;Streaming;
+Keywords[zh_CN]=AirPlay;HomePod;音频;推流;
+StartupNotify=false
+X-GNOME-UsesNotifications=true

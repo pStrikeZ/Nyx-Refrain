@@ -1,0 +1,60 @@
+name: nyx-refrain
+arch: ${PACKAGE_ARCH}
+platform: linux
+version: ${PACKAGE_VERSION}
+release: 1
+section: sound
+priority: optional
+maintainer: ${PACKAGE_MAINTAINER}
+vendor: pStrikeZ
+description: |
+  AirPlay audio sender with a system tray interface and command-line tools
+  Stream system audio to AirPlay speakers using native PipeWire capture.
+license: MIT
+
+recommends:
+  - pipewire
+  - wireplumber
+suggests:
+  - gnome-shell-extension-appindicator
+# nfpm does not emit Arch optdepends; finalize-arch.py adds them and the packager.
+rpm:
+  packager: ${PACKAGE_MAINTAINER}
+
+contents:
+  - src: ${PACKAGE_BIN_DIR}/nyx-refrain
+    dst: /usr/bin/nyx-refrain
+    expand: true
+    file_info:
+      mode: 0755
+  - src: ${PACKAGE_BIN_DIR}/nyxr
+    dst: /usr/bin/nyxr
+    expand: true
+    file_info:
+      mode: 0755
+  - src: packaging/linux/nyx-refrain.desktop
+    dst: /usr/share/applications/nyx-refrain.desktop
+    file_info:
+      mode: 0644
+  - src: assets/icons/hicolor/
+    dst: /usr/share/icons/hicolor
+    file_info:
+      mode: 0644
+  - src: LICENSE
+    dst: /usr/share/licenses/nyx-refrain/LICENSE
+    file_info:
+      mode: 0644
+  - src: LICENSE-fluentui-emoji
+    dst: /usr/share/licenses/nyx-refrain/LICENSE-fluentui-emoji
+    file_info:
+      mode: 0644
+  - src: NOTICE
+    dst: /usr/share/doc/nyx-refrain/NOTICE
+    file_info:
+      mode: 0644
+  - src: ${PACKAGE_WORK_DIR}/copyright
+    dst: /usr/share/doc/nyx-refrain/copyright
+    expand: true
+    packager: deb
+    file_info:
+      mode: 0644

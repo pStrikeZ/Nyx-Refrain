@@ -1,0 +1,29 @@
+[package]
+name = "capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+hound.workspace = true
+rtrb.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+pwnative = { path = "../pwnative" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
+windows-core = "0.58"
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+

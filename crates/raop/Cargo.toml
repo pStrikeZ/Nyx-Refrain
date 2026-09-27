@@ -1,0 +1,30 @@
+[package]
+name = "raop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+rtrb.workspace = true
+rand.workspace = true
+num-bigint.workspace = true
+sha2.workspace = true
+hkdf.workspace = true
+chacha20poly1305.workspace = true
+plist.workspace = true
+pipeline = { path = "../pipeline" }
+capture = { path = "../capture" }
+netutil = { path = "../netutil" }
+serde.workspace = true
+unicode-normalization.workspace = true
+
+
+
+[dev-dependencies]
+serde_json.workspace = true
+tracing-subscriber.workspace = true
