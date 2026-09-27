@@ -1,0 +1,59 @@
+# Checks on every push to master and on pull requests: formatting, clippy on the four
+# targets whose #[cfg] code differs, and unit tests. No artifacts (see build.yml).
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned so a new clippy release cannot turn CI red on its own.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+          targets: x86_64-pc-windows-gnu, aarch64-pc-windows-gnullvm, x86_64-unknown-linux-musl
+
+      # Windows resources are compiled with `zig rc`; musl C code (ring) with `zig cc`.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (Linux, native)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Clippy (Windows x64)
+        run: cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-gnu -- -D warnings
+
+      - name: Clippy (Windows arm64)
+        run: cargo clippy --workspace --all-targets --locked --target aarch64-pc-windows-gnullvm -- -D warnings
+
+      - name: Clippy (Linux musl)
+        env:
+          CC_x86_64_unknown_linux_musl: ${{ github.workspace }}/scripts/zigcc-x86_64-musl.sh
+          AR_x86_64_unknown_linux_musl: zig ar
+        run: cargo clippy --workspace --all-targets --locked --target x86_64-unknown-linux-musl -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --workspace --lib --bins --locked
