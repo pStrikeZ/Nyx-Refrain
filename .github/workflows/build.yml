@@ -22,7 +22,7 @@ jobs:
     steps:
       # Full history and tags: the version string checks whether HEAD is the release tag,
       # and the Linux packages take their timestamp from the last commit.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -45,6 +45,8 @@ jobs:
           version: 0.16.0
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       - name: Install cargo-zigbuild
         run: cargo install cargo-zigbuild --version 0.23.0 --locked
@@ -52,7 +54,9 @@ jobs:
       - name: Install packaging tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y nsis libarchive-tools desktop-file-utils
+          # llvm: build.sh inspects Windows DLL imports with llvm-readobj; GNU objdump
+          # cannot read ARM64 PE files.
+          sudo apt-get install -y nsis libarchive-tools desktop-file-utils llvm
 
       # package-linux.sh uses the git identity as the package maintainer.
       - name: Set packaging identity from the last commit
