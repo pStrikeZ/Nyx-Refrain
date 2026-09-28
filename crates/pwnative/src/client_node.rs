@@ -4,7 +4,7 @@ use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::activation::{
     PW_NODE_ACTIVATION_FINISHED, PW_NODE_ACTIVATION_INACTIVE, PW_VERSION_NODE_ACTIVATION,
@@ -29,10 +29,10 @@ use crate::pod::{
     SPA_FORMAT_MEDIA_TYPE, SPA_IO_BUFFERS, SPA_MEDIA_SUBTYPE_DSP, SPA_MEDIA_SUBTYPE_RAW,
     SPA_MEDIA_TYPE_AUDIO, SPA_PARAM_BUFFERS, SPA_PARAM_BUFFERS_BLOCKS, SPA_PARAM_BUFFERS_BUFFERS,
     SPA_PARAM_BUFFERS_DATA_TYPE, SPA_PARAM_BUFFERS_SIZE, SPA_PARAM_BUFFERS_STRIDE,
-    SPA_PARAM_ENUM_FORMAT, SPA_PARAM_INFO_READ, SPA_PARAM_INFO_READWRITE, SPA_PARAM_INFO_SERIAL,
-    SPA_PARAM_INFO_WRITE, SPA_PARAM_IO, SPA_PARAM_IO_ID, SPA_PARAM_IO_SIZE, SPA_PARAM_PROPS,
-    SPA_TYPE_OBJECT_FORMAT, SPA_TYPE_OBJECT_PARAM_BUFFERS, SPA_TYPE_OBJECT_PARAM_IO,
-    SPA_TYPE_OBJECT_PROPS, align8,
+    SPA_PARAM_ENUM_FORMAT, SPA_PARAM_FORMAT, SPA_PARAM_INFO_READ, SPA_PARAM_INFO_READWRITE,
+    SPA_PARAM_INFO_SERIAL, SPA_PARAM_INFO_WRITE, SPA_PARAM_IO, SPA_PARAM_IO_ID, SPA_PARAM_IO_SIZE,
+    SPA_PARAM_PROPS, SPA_TYPE_OBJECT_FORMAT, SPA_TYPE_OBJECT_PARAM_BUFFERS,
+    SPA_TYPE_OBJECT_PARAM_IO, SPA_TYPE_OBJECT_PROPS, align8,
 };
 use crate::rt::{MAX_BUFFERS_PER_PORT, MAX_PEER_TARGETS, SharedRtData};
 
@@ -117,6 +117,12 @@ pub struct ClientNodeProxy {
     /// Toggled on every Props change so the server emits a param change even when the
     /// flags are otherwise identical (SPA_PARAM_INFO_SERIAL).
     props_serial: bool,
+    /// Format the server set on each port (PortSetParam). The server answers a port's
+    /// Format query from what we announce, so it must be reported back: a link to an
+    /// already configured port (a second stream while one plays) otherwise fails with
+    /// "get input format: No such file or directory" and the new stream is killed.
+    /// (Our ports only take DSP F32, so only whether one is set matters.)
+    port_configured: [bool; 2],
 }
 
 impl ClientNodeProxy {
@@ -130,6 +136,7 @@ impl ClientNodeProxy {
             volumes: [1.0, 1.0],
             mute: false,
             props_serial: false,
+            port_configured: [false, false],
         }
     }
 
@@ -288,7 +295,13 @@ impl ClientNodeProxy {
         b.write_int(port_id as i32);
         let change_mask = PW_CLIENT_NODE_PORT_UPDATE_PARAMS | PW_CLIENT_NODE_PORT_UPDATE_INFO;
         b.write_int(change_mask as i32);
-        b.write_int(3); // n_params = 3 (EnumFormat, Buffers, IO)
+        let configured = self
+            .port_configured
+            .get(port_id as usize)
+            .copied()
+            .unwrap_or(false);
+        // EnumFormat, [Format], Buffers, IO
+        b.write_int(if configured { 4 } else { 3 });
 
         // 1. Param EnumFormat: DSP Float Mono
         let obj_fmt = b.push_object(SPA_TYPE_OBJECT_FORMAT, SPA_PARAM_ENUM_FORMAT);
@@ -299,6 +312,17 @@ impl ClientNodeProxy {
         b.write_prop(SPA_FORMAT_AUDIO_FORMAT, 0);
         b.write_id(SPA_AUDIO_FORMAT_DSP_F32);
         b.pop_object(obj_fmt);
+
+        if configured {
+            let obj = b.push_object(SPA_TYPE_OBJECT_FORMAT, SPA_PARAM_FORMAT);
+            b.write_prop(SPA_FORMAT_MEDIA_TYPE, 0);
+            b.write_id(SPA_MEDIA_TYPE_AUDIO);
+            b.write_prop(SPA_FORMAT_MEDIA_SUBTYPE, 0);
+            b.write_id(SPA_MEDIA_SUBTYPE_DSP);
+            b.write_prop(SPA_FORMAT_AUDIO_FORMAT, 0);
+            b.write_id(SPA_AUDIO_FORMAT_DSP_F32);
+            b.pop_object(obj);
+        }
 
         // 2. Param Buffers
         let obj_buf = b.push_object(SPA_TYPE_OBJECT_PARAM_BUFFERS, SPA_PARAM_BUFFERS);
@@ -343,9 +367,15 @@ impl ClientNodeProxy {
             ("port.physical", "true"),
             ("port.terminal", "true"),
         ]);
-        b.write_int(3); // n_params in info = 3
+        b.write_int(4); // n_params in info
         b.write_id(SPA_PARAM_ENUM_FORMAT);
         b.write_int(SPA_PARAM_INFO_READ as i32);
+        b.write_id(SPA_PARAM_FORMAT);
+        b.write_int(if configured {
+            SPA_PARAM_INFO_READWRITE
+        } else {
+            SPA_PARAM_INFO_WRITE
+        } as i32);
         b.write_id(SPA_PARAM_BUFFERS);
         b.write_int(SPA_PARAM_INFO_READ as i32);
         b.write_id(SPA_PARAM_IO);
@@ -519,7 +549,24 @@ impl ClientNodeProxy {
                 Ok(None)
             }
             PW_CLIENT_NODE_EVENT_PORT_SET_PARAM => {
-                debug!("ClientNode: received PortSetParam event");
+                // Struct { Int direction, Int port_id, Id id, Int flags, Pod param }
+                let mut parser = PodParser::new(&msg.body);
+                let PodValue::Struct(mut items) = parser.next()? else {
+                    return Ok(None);
+                };
+                if items.len() < 5 {
+                    return Ok(None);
+                }
+                let param = items.swap_remove(4);
+                let port_id = items[1].as_u32().unwrap_or(u32::MAX);
+                let id = items[2].as_u32().unwrap_or(0);
+                debug!("ClientNode: PortSetParam port={port_id} id={id}");
+                if id == SPA_PARAM_FORMAT && (port_id as usize) < self.port_configured.len() {
+                    // A None pod clears the format.
+                    self.port_configured[port_id as usize] =
+                        matches!(param, PodValue::Object { .. });
+                    self.send_port_update(conn, port_id)?;
+                }
                 Ok(None)
             }
             PW_CLIENT_NODE_EVENT_PORT_USE_BUFFERS => {
@@ -532,6 +579,7 @@ impl ClientNodeProxy {
                 if let PodValue::Struct(items) = val {
                     if items.len() >= 7 {
                         let port_id = items[1].as_u32().unwrap_or(0);
+                        let mix_id = items[2].as_u32().unwrap_or(SPA_ID_INVALID);
                         let id = items[3].as_u32().unwrap_or(0);
                         let mem_id = items[4]
                             .as_i32()
@@ -540,8 +588,15 @@ impl ClientNodeProxy {
                         let offset = items[5].as_u32().unwrap_or(0);
                         let size = items[6].as_u32().unwrap_or(0);
 
-                        if id == SPA_IO_BUFFERS && (port_id == 0 || port_id == 1) {
+                        let port = self.rt_data.ports.get(port_id as usize);
+                        if id == SPA_IO_BUFFERS
+                            && let Some(port) = port
+                        {
                             if mem_id != SPA_ID_INVALID && size >= 8 {
+                                let Some(mix) = port.mix(mix_id, true) else {
+                                    warn!("ClientNode: port {port_id}: too many links");
+                                    return Ok(None);
+                                };
                                 let map_ptr =
                                     mem_table.mmap_block(mem_id, (offset + size) as usize)?;
                                 let io_ptr =
@@ -550,17 +605,12 @@ impl ClientNodeProxy {
                                     (*io_ptr).status = SPA_STATUS_NEED_DATA;
                                     (*io_ptr).buffer_id = SPA_ID_INVALID;
                                 }
-                                self.rt_data.ports[port_id as usize]
-                                    .io
-                                    .store(io_ptr, Ordering::Release);
+                                mix.io.store(io_ptr, Ordering::Release);
                                 debug!(
-                                    "ClientNode: port {} IO Buffers set at {:?}",
-                                    port_id, io_ptr
+                                    "ClientNode: port {port_id} mix {mix_id} IO Buffers set at {io_ptr:?}"
                                 );
-                            } else {
-                                self.rt_data.ports[port_id as usize]
-                                    .io
-                                    .store(std::ptr::null_mut(), Ordering::Release);
+                            } else if let Some(mix) = port.mix(mix_id, false) {
+                                mix.io.store(std::ptr::null_mut(), Ordering::Release);
                             }
                         }
                     }
@@ -601,7 +651,25 @@ impl ClientNodeProxy {
                 Ok(None)
             }
             PW_CLIENT_NODE_EVENT_PORT_SET_MIX_INFO => {
-                debug!("ClientNode: received PortSetMixInfo event");
+                // Struct { Int direction, Int port_id, Int mix_id, Int peer_id, Struct props }
+                let mut parser = PodParser::new(&msg.body);
+                let PodValue::Struct(items) = parser.next()? else {
+                    return Ok(None);
+                };
+                if items.len() < 4 {
+                    return Ok(None);
+                }
+                let port_id = items[1].as_u32().unwrap_or(u32::MAX);
+                let mix_id = items[2].as_u32().unwrap_or(SPA_ID_INVALID);
+                let peer_id = items[3].as_u32().unwrap_or(SPA_ID_INVALID);
+                debug!("ClientNode: PortSetMixInfo port={port_id} mix={mix_id} peer={peer_id}");
+                if let Some(port) = self.rt_data.ports.get(port_id as usize) {
+                    if peer_id == SPA_ID_INVALID {
+                        port.release_mix(mix_id);
+                    } else if port.mix(mix_id, true).is_none() {
+                        warn!("ClientNode: port {port_id}: too many links");
+                    }
+                }
                 Ok(None)
             }
             PW_CLIENT_NODE_EVENT_COMMAND => {
@@ -688,16 +756,22 @@ impl ClientNodeProxy {
         }
 
         let port_id = items[1].as_u32().unwrap_or(0);
+        let mix_id = items[2].as_u32().unwrap_or(SPA_ID_INVALID);
         let n_buffers = items[4].as_u32().unwrap_or(0) as usize;
 
-        if port_id != 0 && port_id != 1 {
+        let Some(port) = self.rt_data.ports.get(port_id as usize) else {
             return Ok(());
-        }
+        };
+        let Some(mix) = port.mix(mix_id, n_buffers > 0) else {
+            if n_buffers > 0 {
+                warn!("ClientNode: port {port_id}: too many links");
+            }
+            return Ok(());
+        };
+        // Old buffers go away with this call: stop the RT thread using them first.
+        mix.n_buffers.store(0, Ordering::Release);
 
-        debug!(
-            "ClientNode: port {} use_buffers (n_buffers={})",
-            port_id, n_buffers
-        );
+        debug!("ClientNode: port {port_id} mix {mix_id} use_buffers (n_buffers={n_buffers})");
         let mut item_idx = 5;
 
         for buf_idx in 0..n_buffers.min(MAX_BUFFERS_PER_PORT) {
@@ -754,15 +828,15 @@ impl ClientNodeProxy {
                 }
             }
 
-            let port_ref = &self.rt_data.ports[port_id as usize];
-            let buf_ref = &port_ref.buffers[buf_idx];
+            let buf_ref = &mix.buffers[buf_idx];
             buf_ref.chunk.store(chunk_ptr as *mut _, Ordering::Release);
             buf_ref.data.store(data_ptr as *mut _, Ordering::Release);
         }
 
-        self.rt_data.ports[port_id as usize]
-            .n_buffers
-            .store(n_buffers as u32, Ordering::Release);
+        mix.n_buffers.store(
+            n_buffers.min(MAX_BUFFERS_PER_PORT) as u32,
+            Ordering::Release,
+        );
 
         Ok(())
     }

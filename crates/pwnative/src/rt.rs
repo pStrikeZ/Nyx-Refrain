@@ -42,19 +42,116 @@ impl Default for BufferRef {
     }
 }
 
-pub struct PortRef {
+/// Links one input port can take at once (one per stream playing into the sink).
+pub const MAX_MIXES_PER_PORT: usize = 16;
+
+/// One link into an input port. PipeWire gives every link its own buffers and io area
+/// (identified by a mix id) and the client mixes them, like pw_impl_port's mixer does.
+pub struct MixRef {
+    pub used: AtomicBool,
+    pub mix_id: AtomicU32,
     pub io: AtomicPtr<SpaIoBuffers>,
     pub n_buffers: AtomicU32,
     pub buffers: [BufferRef; MAX_BUFFERS_PER_PORT],
 }
 
-impl Default for PortRef {
-    fn default() -> Self {
+impl MixRef {
+    pub const fn new() -> Self {
         Self {
+            used: AtomicBool::new(false),
+            mix_id: AtomicU32::new(0),
             io: AtomicPtr::new(std::ptr::null_mut()),
             n_buffers: AtomicU32::new(0),
             buffers: [const { BufferRef::new() }; MAX_BUFFERS_PER_PORT],
         }
+    }
+}
+
+impl Default for MixRef {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct PortRef {
+    pub mixes: [MixRef; MAX_MIXES_PER_PORT],
+}
+
+impl PortRef {
+    /// The slot of `mix_id`, allocating a free one when `create` is set.
+    pub fn mix(&self, mix_id: u32, create: bool) -> Option<&MixRef> {
+        let found = self
+            .mixes
+            .iter()
+            .find(|m| m.used.load(Ordering::Acquire) && m.mix_id.load(Ordering::Acquire) == mix_id);
+        if found.is_some() || !create {
+            return found;
+        }
+        let free = self
+            .mixes
+            .iter()
+            .find(|m| !m.used.load(Ordering::Acquire))?;
+        free.io.store(std::ptr::null_mut(), Ordering::Release);
+        free.n_buffers.store(0, Ordering::Release);
+        free.mix_id.store(mix_id, Ordering::Release);
+        free.used.store(true, Ordering::Release);
+        Some(free)
+    }
+
+    /// Forgets the link `mix_id` (its peer went away).
+    pub fn release_mix(&self, mix_id: u32) {
+        if let Some(m) = self.mix(mix_id, false) {
+            m.io.store(std::ptr::null_mut(), Ordering::Release);
+            m.n_buffers.store(0, Ordering::Release);
+            m.used.store(false, Ordering::Release);
+        }
+    }
+}
+
+impl Default for PortRef {
+    fn default() -> Self {
+        Self {
+            mixes: [const { MixRef::new() }; MAX_MIXES_PER_PORT],
+        }
+    }
+}
+
+/// The samples of one port's link this cycle, or `None` if it has no buffer ready.
+///
+/// # Safety
+///
+/// The mix's io and buffer pointers must point into mapped PipeWire memory.
+unsafe fn mix_samples(mix: &MixRef) -> Option<&[f32]> {
+    if !mix.used.load(Ordering::Acquire) {
+        return None;
+    }
+    let io = mix.io.load(Ordering::Acquire);
+    if io.is_null() {
+        return None;
+    }
+    let id = unsafe { (*io).buffer_id };
+    let n_buffers = mix.n_buffers.load(Ordering::Acquire);
+    if id >= n_buffers || id as usize >= MAX_BUFFERS_PER_PORT {
+        return None;
+    }
+    let buf = &mix.buffers[id as usize];
+    let chunk = buf.chunk.load(Ordering::Acquire);
+    let data = buf.data.load(Ordering::Acquire);
+    if chunk.is_null() || data.is_null() {
+        return None;
+    }
+    let (offset, size) = unsafe { ((*chunk).offset as usize / 4, (*chunk).size as usize / 4) };
+    Some(unsafe { std::slice::from_raw_parts(data.add(offset), size) })
+}
+
+/// Hands the link's buffer back to the host.
+fn recycle_mix(mix: &MixRef) {
+    if !mix.used.load(Ordering::Acquire) {
+        return;
+    }
+    let io = mix.io.load(Ordering::Acquire);
+    if !io.is_null() {
+        unsafe { (*io).status = SPA_STATUS_NEED_DATA };
     }
 }
 
@@ -125,6 +222,12 @@ pub unsafe fn run_data_thread(
     stop_flag: Arc<AtomicBool>,
 ) {
     debug!("Realtime data thread started on readfd={}", readfd);
+
+    // Mix buffers for FL / FR, allocated once (never on the data cycle path).
+    let mut mixed = [
+        vec![0.0f32; MAX_SILENCE_FRAMES],
+        vec![0.0f32; MAX_SILENCE_FRAMES],
+    ];
 
     // The activation status is moved INACTIVE -> FINISHED by the Start command handler
     // (client_node.rs), not here: the node must not be scheduled before it is started.
@@ -199,68 +302,32 @@ pub unsafe fn run_data_thread(
         let rate_denom = clock.rate.denom;
         let rate = if rate_denom == 0 { 48000 } else { rate_denom };
 
-        // 4. Read audio from input ports 0 (FL) and 1 (FR)
-        let io0 = rt_data.ports[0].io.load(Ordering::Acquire);
-        let io1 = rt_data.ports[1].io.load(Ordering::Acquire);
-
-        let mut samples_pushed = 0;
-        if !io0.is_null() && !io1.is_null() {
-            let (_st0, id0) = unsafe { ((*io0).status, (*io0).buffer_id) };
-            let (_st1, id1) = unsafe { ((*io1).status, (*io1).buffer_id) };
-
-            let n_buf0 = rt_data.ports[0].n_buffers.load(Ordering::Acquire);
-            let n_buf1 = rt_data.ports[1].n_buffers.load(Ordering::Acquire);
-
-            if id0 < n_buf0
-                && id1 < n_buf1
-                && (id0 as usize) < MAX_BUFFERS_PER_PORT
-                && (id1 as usize) < MAX_BUFFERS_PER_PORT
-            {
-                let buf0 = &rt_data.ports[0].buffers[id0 as usize];
-                let buf1 = &rt_data.ports[1].buffers[id1 as usize];
-
-                let chunk0_ptr = buf0.chunk.load(Ordering::Acquire);
-                let chunk1_ptr = buf1.chunk.load(Ordering::Acquire);
-                let data0_ptr = buf0.data.load(Ordering::Acquire);
-                let data1_ptr = buf1.data.load(Ordering::Acquire);
-
-                if !chunk0_ptr.is_null()
-                    && !chunk1_ptr.is_null()
-                    && !data0_ptr.is_null()
-                    && !data1_ptr.is_null()
-                {
-                    let chunk0 = unsafe { &*chunk0_ptr };
-                    let chunk1 = unsafe { &*chunk1_ptr };
-
-                    let n_samples0 = (chunk0.size / 4) as usize;
-                    let n_samples1 = (chunk1.size / 4) as usize;
-                    let n_frames = n_samples0.min(n_samples1);
-
-                    let offset0 = (chunk0.offset / 4) as usize;
-                    let offset1 = (chunk1.offset / 4) as usize;
-
-                    let fl_ptr = unsafe { data0_ptr.add(offset0) };
-                    let fr_ptr = unsafe { data1_ptr.add(offset1) };
-
-                    let available_slots = sample_producer.slots() / 2;
-                    let frames_to_push = n_frames.min(available_slots);
-
-                    for i in 0..frames_to_push {
-                        let s_fl = unsafe { *fl_ptr.add(i) };
-                        let s_fr = unsafe { *fr_ptr.add(i) };
-                        let _ = sample_producer.push(s_fl);
-                        let _ = sample_producer.push(s_fr);
-                    }
-                    samples_pushed = frames_to_push;
+        // 4. Mix every link into input ports 0 (FL) and 1 (FR), then interleave.
+        let mut filled = [0usize; 2];
+        for ((port, out), filled) in rt_data.ports.iter().zip(mixed.iter_mut()).zip(&mut filled) {
+            for mix in &port.mixes {
+                let Some(samples) = (unsafe { mix_samples(mix) }) else {
+                    continue;
+                };
+                let n = samples.len().min(out.len());
+                if n > *filled {
+                    out[*filled..n].fill(0.0);
+                    *filled = n;
+                }
+                for (o, s) in out[..n].iter_mut().zip(samples) {
+                    *o += *s;
                 }
             }
-
-            // Return buffers back to host on every cycle
-            unsafe {
-                (*io0).status = SPA_STATUS_NEED_DATA;
-                (*io1).status = SPA_STATUS_NEED_DATA;
-            }
+            port.mixes.iter().for_each(recycle_mix);
         }
+        let n_frames = filled[0].min(filled[1]);
+        let frames_to_push = n_frames.min(sample_producer.slots() / 2);
+        let [fl, fr] = &mixed;
+        for (l, r) in fl.iter().zip(fr).take(frames_to_push) {
+            let _ = sample_producer.push(*l);
+            let _ = sample_producer.push(*r);
+        }
+        let mut samples_pushed = frames_to_push;
 
         // No linked input (or no buffer this cycle): deliver one quantum of silence so the
         // capture stream keeps wall-clock pace like WASAPI loopback does while idle
@@ -336,4 +403,28 @@ pub unsafe fn run_data_thread(
     }
 
     debug!("Realtime data thread exited cleanly");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn links_get_their_own_mix_slots_until_released() {
+        let port = PortRef::default();
+        assert!(port.mix(7, false).is_none());
+        let a = port.mix(7, true).unwrap() as *const MixRef;
+        let b = port.mix(9, true).unwrap() as *const MixRef;
+        assert_ne!(a, b);
+        assert_eq!(port.mix(7, true).unwrap() as *const MixRef, a);
+
+        port.release_mix(7);
+        assert!(port.mix(7, false).is_none());
+        assert_eq!(port.mix(9, false).unwrap() as *const MixRef, b);
+
+        for id in 100..100 + MAX_MIXES_PER_PORT as u32 - 1 {
+            assert!(port.mix(id, true).is_some());
+        }
+        assert!(port.mix(1000, true).is_none(), "all slots are taken");
+    }
 }
