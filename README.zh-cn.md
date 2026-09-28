@@ -35,6 +35,8 @@ Nyx Refrain 是用纯 Rust 实现的 AirPlay 2 realtime 发送端：自带配对
 
 ## 安装
 
+Windows（x64 / ARM64）与 Linux（x86_64 / aarch64 / loongarch64）同等对待：每个版本都为全部架构构建安装包，功能一致。
+
 从 [Releases](https://github.com/pStrikeZ/Nyx-Refrain/releases) 下载对应系统和架构的安装包。
 
 ### Windows
@@ -146,10 +148,21 @@ rules:
 
 ## 已知限制
 
-- 仅支持 AirPlay 2，不支持 AirPlay 1；一次只推送到一台接收端，暂不支持多房间。
+- 仅支持 AirPlay 2，不支持 AirPlay 1；一次只推送到一台接收端，暂不支持 HomePod 立体声对和多房间。
 - 暂无 macOS 版本。
 - 在音箱上按暂停时，电脑上的播放器会暂停，但音频流本身不中断；音箱不显示进度条，也不支持在音箱上拖动进度。
 - 第三方发送端的曲目信息不会显示在 Apple「家庭」App 和控制中心里，可以在 Home Assistant 等基于 pyatv 的工具中看到。
+
+---
+
+## 路线图
+
+下面两项是计划中的功能，目前卡在缺少测试设备：
+
+- **HomePod 立体声对**：两台组成立体声对的 HomePod 需要分别建立连接、共用同一条播放时间线，同步效果必须用两台实机调。
+- **macOS 版**：需要一台 Mac 来开发和测试系统音频采集。
+
+如果你有这些设备并愿意帮忙测试，欢迎在 Issue 里说一声。
 
 ---
 
@@ -181,7 +194,7 @@ cargo test --workspace --lib --bins
 
 ## 参与贡献
 
-欢迎提交 Issue 和 PR，尤其是多房间（AirPlay 2 多目标）和 macOS 支持。
+欢迎提交 Issue 和 PR，尤其是 HomePod 立体声对、多房间和 macOS 支持。
 
 ---
 

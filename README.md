@@ -35,6 +35,8 @@ Nyx Refrain is an AirPlay 2 realtime sender written in pure Rust. It does its ow
 
 ## Installation
 
+Windows (x64 / ARM64) and Linux (x86_64 / aarch64 / loongarch64) are treated equally: every release ships packages for all of these architectures, with the same features.
+
 Download the package for your system and architecture from [Releases](https://github.com/pStrikeZ/Nyx-Refrain/releases).
 
 ### Windows
@@ -146,10 +148,21 @@ rules:
 
 ## Known limitations
 
-- AirPlay 2 only, no AirPlay 1; one receiver per stream, no multi-room yet.
+- AirPlay 2 only, no AirPlay 1; one receiver per stream, no HomePod stereo pairs or multi-room yet.
 - No macOS version yet.
 - Pressing pause on the speaker pauses the player on your PC, but the audio stream itself keeps running; the speaker shows no progress bar and seeking from the speaker is not supported.
 - Track info from third-party senders is not shown in Apple's Home app or Control Center; tools based on pyatv, such as Home Assistant, do show it.
+
+---
+
+## Roadmap
+
+Two features are planned but currently blocked on test hardware:
+
+- **HomePod stereo pairs**: the two HomePods in a stereo pair each need their own connection on one shared playback timeline, and getting them in sync takes two real devices.
+- **macOS version**: needs a Mac to develop and test system audio capture on.
+
+If you have this hardware and would like to help test, please say so in an issue.
 
 ---
 
@@ -181,7 +194,7 @@ cargo test --workspace --lib --bins
 
 ## Contributing
 
-Issues and PRs are welcome, especially for multi-room (AirPlay 2 multiple targets) and macOS support.
+Issues and PRs are welcome, especially for HomePod stereo pairs, multi-room and macOS support.
 
 ---
 
