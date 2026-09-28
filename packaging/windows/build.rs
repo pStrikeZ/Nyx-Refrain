@@ -2,7 +2,11 @@
 //! target, plus on Windows the icon and the VERSIONINFO block shown by Explorer (Details
 //! tab) and Task Manager (name, publisher).
 
-use std::{env, fs, path::PathBuf, process::Command};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 fn main() {
     println!("cargo:rerun-if-changed=../../packaging/windows/build.rs");
@@ -54,12 +58,18 @@ fn build_version() -> String {
         return version;
     };
     // HEAD moves on commit / checkout; the index changes whenever tracked files are staged or
-    // their stat info is refreshed, which is close enough for the dirty flag.
-    for f in ["HEAD", "index", "packed-refs", "refs/tags"] {
-        println!("cargo:rerun-if-changed={git_dir}/{f}");
-    }
-    if let Some(head_ref) = git(&["symbolic-ref", "-q", "HEAD"]) {
-        println!("cargo:rerun-if-changed={git_dir}/{head_ref}");
+    // their stat info is refreshed, which is close enough for the dirty flag. Only existing
+    // paths are watched: cargo treats a missing rerun-if-changed path as always stale, and
+    // `packed-refs` often does not exist. A packed branch ref has no loose file until the next
+    // commit creates one, so `refs/heads` is watched instead.
+    let head_ref = git(&["symbolic-ref", "-q", "HEAD"])
+        .filter(|r| Path::new(&format!("{git_dir}/{r}")).exists())
+        .unwrap_or_else(|| "refs/heads".to_string());
+    for f in ["HEAD", "index", "packed-refs", "refs/tags", &head_ref] {
+        let path = format!("{git_dir}/{f}");
+        if Path::new(&path).exists() {
+            println!("cargo:rerun-if-changed={path}");
+        }
     }
     let Some(hash) = git(&["rev-parse", "--short=7", "HEAD"]) else {
         return version;
