@@ -112,6 +112,13 @@ impl Default for Settings {
 
 impl Settings {
     fn path() -> std::path::PathBuf {
+        // Tests drive code that saves (tray actions, the engine); keep them off the user's
+        // real gui.toml.
+        #[cfg(test)]
+        return std::env::temp_dir()
+            .join(format!("nyx-refrain-test-{}", std::process::id()))
+            .join("gui.toml");
+        #[cfg(not(test))]
         discovery::default_config_dir().join("gui.toml")
     }
 
