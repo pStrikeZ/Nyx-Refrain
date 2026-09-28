@@ -371,6 +371,16 @@ pub fn build_menu_model(
         });
     }
 
+    // Version (disabled). Windows shows it in the flyout; Linux has only this menu.
+    if platform == MenuPlatform::Linux {
+        items.push(TrayMenuItem {
+            label: concat!("Nyx Refrain ", env!("NYX_VERSION")).to_string(),
+            enabled: false,
+            kind: MenuItemKind::Standard,
+            action: None,
+        });
+    }
+
     // 13. Separator
     items.push(TrayMenuItem {
         label: String::new(),
@@ -836,7 +846,8 @@ mod tests {
             ..Default::default()
         };
 
-        // On Linux (include_capture_mode = false): no capture mode item, total 13 items
+        // On Linux (include_capture_mode = false): no capture mode item but a version row,
+        // total 14 items
         let linux_items =
             build_menu_model(&snap, &settings, false, Lang::ZhCn, MenuPlatform::Linux);
         assert!(
@@ -844,7 +855,12 @@ mod tests {
                 .iter()
                 .any(|it| it.action == Some(TrayMenuAction::ToggleCaptureMode))
         );
-        assert_eq!(linux_items.len(), 13);
+        assert_eq!(linux_items.len(), 14);
+        assert!(
+            linux_items[linux_items.len() - 3]
+                .label
+                .starts_with("Nyx Refrain v")
+        );
 
         // On Windows (include_capture_mode = true): has capture mode item, total 14 items
         let win_items =

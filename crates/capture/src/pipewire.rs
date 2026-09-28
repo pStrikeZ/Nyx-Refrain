@@ -164,6 +164,11 @@ impl AudioSource for PipeWireSinkSource {
         self.timeline_valid = false;
         self.pending = None;
         self.gap_frames_left = 0;
+        // The sink keeps running between sessions (the GUI keeps it across reconnects);
+        // audio queued while nobody read it is stale.
+        if let Some(c) = self.consumer.as_mut() {
+            while c.pop_chunk(1 << 16).is_some() {}
+        }
         Ok(())
     }
 

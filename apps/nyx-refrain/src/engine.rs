@@ -190,21 +190,40 @@ const RESUME_ADDR_GRACE: Duration = Duration::from_secs(20);
 const RESUME_FIRST_BACKOFF: Duration = Duration::from_secs(3);
 const RESUME_MAX_BACKOFF: Duration = Duration::from_secs(15);
 
-/// In-progress resume of the session that was streaming when the app last exited.
+/// How long a session interrupted by the network keeps reconnecting (the Linux virtual sink
+/// stays in place meanwhile) before giving up with an error.
+const RECONNECT_WINDOW: Duration = Duration::from_secs(60);
+
+/// In-progress resume: of the session that was streaming when the app last exited, or of a
+/// session the network interrupted.
 struct Resume {
     since: Instant,
+    window: Duration,
     next_attempt: Instant,
     backoff: Duration,
     last_error: Option<EngineError>,
+    /// Reconnect: the interrupted session's parameters (instead of the saved device).
+    retry: Option<StartParams>,
 }
 
 impl Resume {
     fn new(now: Instant) -> Self {
         Self {
             since: now,
+            window: RESUME_WINDOW,
             next_attempt: now,
             backoff: RESUME_FIRST_BACKOFF,
             last_error: None,
+            retry: None,
+        }
+    }
+
+    fn reconnect(now: Instant, params: StartParams, err: EngineError) -> Self {
+        Self {
+            window: RECONNECT_WINDOW,
+            last_error: Some(err),
+            retry: Some(params),
+            ..Self::new(now)
         }
     }
 }
@@ -371,24 +390,99 @@ fn make_source(
     ))
 }
 
+/// Capture side of a session that outlives it. On Linux this is the virtual sink (the
+/// default output): removing it while a dropped session reconnects would break the players'
+/// streams, and most players pause when that happens.
+#[cfg(target_os = "linux")]
+struct Capture {
+    source: SharedSource,
+    vol_ctrl: Option<capture::pipewire::SinkVolumeControl>,
+    vol_rx: tokio::sync::watch::Receiver<Option<SinkVol>>,
+}
+
+/// Windows loopback capture is simply reopened per session.
+#[cfg(not(target_os = "linux"))]
+enum Capture {}
+
+/// Hands one capture source to successive sessions; a session stopping does not stop it
+/// (dropping the last handle does).
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct SharedSource(Arc<Mutex<Box<dyn capture::AudioSource + Send>>>);
+
+#[cfg(target_os = "linux")]
+impl SharedSource {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Box<dyn capture::AudioSource + Send>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl capture::AudioSource for SharedSource {
+    fn sample_rate(&self) -> u32 {
+        self.lock().sample_rate()
+    }
+
+    fn channels(&self) -> u16 {
+        self.lock().channels()
+    }
+
+    fn read_chunk(
+        &mut self,
+        max_frames: usize,
+    ) -> Result<Option<capture::AudioChunk>, Box<dyn std::error::Error + Send + Sync>> {
+        self.lock().read_chunk(max_frames)
+    }
+
+    fn start(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.lock().start()
+    }
+
+    fn is_live(&self) -> bool {
+        self.lock().is_live()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn new_capture(p: &StartParams) -> Result<Capture, EngineError> {
+    let (source, vol_ctrl) = make_source(p.volume_pct, p.capture_mode)
+        .map_err(|e| EngineError::Capture(e.to_string()))?;
+    let (vol_tx, vol_rx) = tokio::sync::watch::channel(None);
+    if let Some(vc) = &vol_ctrl {
+        vc.on_change(move |v| {
+            let _ = vol_tx.send(Some(v));
+        });
+    }
+    Ok(Capture {
+        source: SharedSource(Arc::new(Mutex::new(source))),
+        vol_ctrl,
+        vol_rx,
+    })
+}
+
 struct Running {
     session: Ap2Session,
     metrics: pipeline::SharedPipelineMetrics,
+    params: StartParams,
     #[allow(dead_code)]
     send_now_playing: bool,
     _now_playing_watcher: Option<nowplaying::NowPlayingWatcher>,
     /// Forward receiver playback commands to the now-playing session (needs the watcher).
     remote_control: bool,
     #[cfg(target_os = "linux")]
-    vol_ctrl: Option<capture::pipewire::SinkVolumeControl>,
-    #[cfg(target_os = "linux")]
-    vol_rx: Option<tokio::sync::watch::Receiver<Option<capture::pipewire::SinkVolume>>>,
+    capture: Capture,
 }
 
 impl Running {
-    async fn stop(mut self) {
+    /// Tears down the session and hands back the capture for a later session (dropping it
+    /// removes the Linux virtual sink).
+    async fn stop(mut self) -> Option<Capture> {
         self._now_playing_watcher = None;
         self.session.stop().await;
+        #[cfg(target_os = "linux")]
+        return Some(self.capture);
+        #[cfg(not(target_os = "linux"))]
+        None
     }
 }
 
@@ -398,6 +492,8 @@ async fn run(
     notifier: Arc<dyn Notifier>,
 ) {
     let mut running: Option<Running> = None;
+    // Capture kept while an interrupted session reconnects (see [`Capture`]).
+    let mut kept: Option<Capture> = None;
     let mut now_playing_rx: Option<tokio::sync::watch::Receiver<nowplaying::NowPlaying>> = None;
     let mut remote_rx: Option<mpsc::Receiver<raop::ap2::remote::Command>> = None;
     let mut last_sent_track: Option<nowplaying::NowPlaying> = None;
@@ -449,7 +545,7 @@ async fn run(
                             remember_streaming(&settings_ref, true);
                         }
                         if let Some(r) = running.take() {
-                            r.stop().await;
+                            kept = r.stop().await;
                         }
                         #[cfg(target_os = "linux")]
                         {
@@ -466,7 +562,7 @@ async fn run(
                         // output) before connecting, so an unreachable device would silence the
                         // desktop for a whole connect timeout.
                         let started = match reachable(p.device.addr).await {
-                            Ok(()) => start(&p).await,
+                            Ok(()) => start(&p, &mut kept).await,
                             Err(e) => Err(e),
                         }
                         .map_err(|e| explain_not_local(p.device.addr, e));
@@ -511,7 +607,10 @@ async fn run(
                                     r.last_error = Some(e);
                                     set_state(&shared, &*notifier, State::Connecting);
                                 }
-                                _ => set_state(&shared, &*notifier, State::Error(e)),
+                                _ => {
+                                    kept = None;
+                                    set_state(&shared, &*notifier, State::Error(e));
+                                }
                             },
                         }
                     }
@@ -523,6 +622,7 @@ async fn run(
                         if let Some(r) = running.take() {
                             r.stop().await;
                         }
+                        kept = None;
                         now_playing_rx = None;
                         remote_rx = None;
                         last_sent_track = None;
@@ -596,7 +696,7 @@ async fn run(
                                 tracing_like_warn(&format!("set volume failed: {e}"));
                             }
                             #[cfg(target_os = "linux")]
-                            if let Some(vc) = &r.vol_ctrl {
+                            if let Some(vc) = &r.capture.vol_ctrl {
                                 vc.set(pct, pct <= 0.0);
                             }
                         }
@@ -647,11 +747,12 @@ async fn run(
                 let now = Instant::now();
                 if let Some(r) = resume.as_mut() {
                     let elapsed = now.duration_since(r.since);
-                    if elapsed >= RESUME_WINDOW {
+                    if elapsed >= r.window {
                         let e = r.last_error.take().unwrap_or_else(|| {
                             EngineError::Connect("saved device not found on the network".into())
                         });
                         resume = None;
+                        kept = None;
                         set_state(&shared, &*notifier, State::Error(e));
                     } else if now >= r.next_attempt {
                         let settings = settings_ref
@@ -661,9 +762,16 @@ async fn run(
                             .lock()
                             .map(|g| (g.devices.clone(), g.discovering))
                             .unwrap_or_default();
-                        let params = settings.and_then(|s| {
-                            resume_params(&s, &devices, elapsed >= RESUME_ADDR_GRACE)
-                        });
+                        let params = match &r.retry {
+                            // Reconnect to the same receiver, with the current volume.
+                            Some(p) => Some(StartParams {
+                                volume_pct: settings.map_or(p.volume_pct, |s| s.volume_pct),
+                                ..p.clone()
+                            }),
+                            None => settings.and_then(|s| {
+                                resume_params(&s, &devices, elapsed >= RESUME_ADDR_GRACE)
+                            }),
+                        };
                         match params {
                             Some(p) => {
                                 r.next_attempt = now + r.backoff;
@@ -694,7 +802,7 @@ async fn run(
             _v = async {
                 #[cfg(target_os = "linux")]
                 {
-                    match running.as_mut().and_then(|r| r.vol_rx.as_mut()) {
+                    match running.as_mut().map(|r| &mut r.capture.vol_rx) {
                         Some(rx) => {
                             if rx.changed().await.is_ok() {
                                 *rx.borrow_and_update()
@@ -750,7 +858,7 @@ async fn run(
                                 s.save();
                             }
                             #[cfg(target_os = "linux")]
-                            if let Some(vc) = &r.vol_ctrl {
+                            if let Some(vc) = &r.capture.vol_ctrl {
                                 last_receiver_vol = Some(pct);
                                 vc.set(pct, pct <= 0.0);
                             }
@@ -811,16 +919,22 @@ async fn run(
                     None => None,
                 };
                 if let Some(e) = failed {
-                    if let Some(r) = running.take() {
-                        r.stop().await;
-                    }
                     now_playing_rx = None;
                     remote_rx = None;
                     last_sent_track = None;
                     if let Ok(mut g) = shared.lock() {
                         g.track_title = None;
                     }
-                    set_state(&shared, &*notifier, State::Error(EngineError::Interrupted(e.to_string())));
+                    let err = EngineError::Interrupted(e.to_string());
+                    if let Some(r) = running.take() {
+                        let params = r.params.clone();
+                        kept = r.stop().await;
+                        tracing_like_warn(&format!("session interrupted ({e}); reconnecting"));
+                        resume = Some(Resume::reconnect(Instant::now(), params, err));
+                        set_state(&shared, &*notifier, State::Connecting);
+                    } else {
+                        set_state(&shared, &*notifier, State::Error(err));
+                    }
                 }
             }
             _ = refresh.tick(), if running.is_some() => {
@@ -882,6 +996,7 @@ async fn send_engine_metadata(
 
 async fn start(
     p: &StartParams,
+    kept: &mut Option<Capture>,
 ) -> Result<
     (
         Running,
@@ -898,17 +1013,19 @@ async fn start(
         quiet_mode: false,
         ..Default::default()
     };
-    let (source, _vol_ctrl) = make_source(p.volume_pct, p.capture_mode)
-        .map_err(|e| EngineError::Capture(e.to_string()))?;
     #[cfg(target_os = "linux")]
-    let (vol_tx, vol_rx) = tokio::sync::watch::channel(None);
+    let capture = match kept.take() {
+        Some(c) => c,
+        None => new_capture(p)?,
+    };
     #[cfg(target_os = "linux")]
-    if let Some(ref vc) = _vol_ctrl {
-        let tx = vol_tx;
-        vc.on_change(move |v| {
-            let _ = tx.send(Some(v));
-        });
-    }
+    let source: Box<dyn capture::AudioSource + Send> = Box::new(capture.source.clone());
+    #[cfg(not(target_os = "linux"))]
+    let (source, _) = {
+        let _ = kept;
+        make_source(p.volume_pct, p.capture_mode)
+            .map_err(|e| EngineError::Capture(e.to_string()))?
+    };
     let ring = pipeline::DEFAULT_RING_BUFFER_PACKETS;
     let metrics: pipeline::SharedPipelineMetrics =
         Arc::new(pipeline::PipelineMetricsTracker::new(ring));
@@ -930,19 +1047,26 @@ async fn start(
             let mut running = Running {
                 session,
                 metrics,
+                params: p.clone(),
                 send_now_playing: p.send_now_playing,
                 _now_playing_watcher: watcher,
                 remote_control: p.remote_control,
                 #[cfg(target_os = "linux")]
-                vol_ctrl: _vol_ctrl,
-                #[cfg(target_os = "linux")]
-                vol_rx: Some(vol_rx),
+                capture,
             };
             let remote_rx = running.session.take_remote_commands();
             Ok((running, rx, remote_rx))
         }
-        Err(Ap2Error::NotSupported(m)) => Err(EngineError::NotSupported(m)),
-        Err(e) => Err(EngineError::Connect(e.to_string())),
+        Err(e) => {
+            #[cfg(target_os = "linux")]
+            {
+                *kept = Some(capture);
+            }
+            Err(match e {
+                Ap2Error::NotSupported(m) => EngineError::NotSupported(m),
+                e => EngineError::Connect(e.to_string()),
+            })
+        }
     }
 }
 
