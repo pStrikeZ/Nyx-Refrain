@@ -214,6 +214,7 @@ pub fn start_pipeline_feeder(
     std::thread::Builder::new()
         .name("nyx-refrain-feeder".into())
         .spawn(move || {
+            let _priority = capture::enter_audio_thread_priority();
             let mut processor = match PipelineProcessor::new(
                 sample_rate,
                 metrics.clone(),

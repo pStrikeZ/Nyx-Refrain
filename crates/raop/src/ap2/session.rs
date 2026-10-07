@@ -681,6 +681,7 @@ impl Ap2Session {
                 std::thread::Builder::new()
                     .name("ap2-timing".into())
                     .spawn(move || {
+                        let _priority = capture::enter_audio_thread_priority();
                         let mut buf = [0u8; 128];
                         let mut out = [0u8; TIMING_PACKET_SIZE];
                         while !stop.load(Ordering::Relaxed) {
@@ -892,6 +893,7 @@ impl Ap2Session {
                 std::thread::Builder::new()
                     .name("ap2-control".into())
                     .spawn(move || {
+                        let _priority = capture::enter_audio_thread_priority();
                         let mut out = [0u8; SYNC_PACKET_SIZE];
                         let mut buf = [0u8; 2048];
                         let mut pkt = [0u8; super::history::MAX_PACKET];
@@ -966,6 +968,7 @@ impl Ap2Session {
             let guard = quiet_guard.clone();
             threads.push(std::thread::Builder::new().name("ap2-audio".into()).spawn(
                 move || {
+                    let _priority = capture::enter_audio_thread_priority();
                     let mut cipher = AudioCipher::new(&shk);
                     let mut pcm = [0i16; SAMPLES_PER_PACKET];
                     let mut payload = [0u8; PCM_BYTES];

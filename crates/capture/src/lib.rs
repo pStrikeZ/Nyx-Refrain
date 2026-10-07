@@ -31,6 +31,17 @@ pub use wasapi::{
 #[cfg(target_os = "linux")]
 pub use pipewire::{PipeWireSinkConfig, PipeWireSinkSource, SinkVolume, SinkVolumeControl};
 
+/// Puts the calling thread in the MMCSS "Pro Audio" class on Windows until the returned guard
+/// is dropped, so a fully loaded CPU does not starve the audio path. Only the few threads that
+/// produce or pace audio should call this; elsewhere it does nothing.
+#[must_use]
+pub fn enter_audio_thread_priority() -> impl Sized {
+    #[cfg(windows)]
+    {
+        wasapi::MmcssGuard::enter_pro_audio()
+    }
+}
+
 /// A chunk of audio PCM samples delivered by an `AudioSource`.
 ///
 /// Holds interleaved f32 samples, format metadata, and the monotonic
