@@ -9,8 +9,9 @@ pub mod silence_stream;
 
 pub use com::{ComMtaGuard, MmcssGuard};
 pub use endpoint::{
-    DeviceInfo, DeviceSpec, EndpointMuteGuard, create_device_enumerator, get_default_render_device,
-    get_device_friendly_name, get_device_id, list_render_endpoints, open_render_device,
+    DefaultOutputGuard, DeviceInfo, DeviceSpec, EndpointMuteGuard, create_device_enumerator,
+    get_default_render_device, get_device_friendly_name, get_device_id, list_render_endpoints,
+    open_render_device,
 };
 pub use loopback::{WasapiLoopbackConfig, WasapiLoopbackSource};
 pub use notification::{DeviceNotificationClient, NotificationRegistration};

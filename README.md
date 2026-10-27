@@ -80,7 +80,7 @@ sudo pacman -U ./nyx-refrain-*.pkg.tar.zst    # Arch Linux
 
 **Windows Firewall**: AirPlay 2 needs the speaker to connect back to your PC (timing and control channels), so Nyx Refrain must be allowed to accept inbound connections. On first use, if the flyout says the firewall is blocking it, click **Allow in Firewall** (this asks for administrator permission).
 
-**Settings** (the ⚙ in the top-right corner of the flyout on Windows, the tray menu on Linux): **Language**, **Send now playing**, **Allow receiver playback controls**, **Resume streaming on launch**, **Launch at login**; Windows also has **Use device loopback capture** and **Mute this PC while streaming** (on by default; not available with device loopback capture).
+**Settings** (the ⚙ in the top-right corner of the flyout on Windows, the tray menu on Linux): **Language**, **Send now playing**, **Allow receiver playback controls**, **Resume streaming on launch**, **Launch at login**; Windows also has **Use device loopback capture** and **Mute this PC while streaming** (on by default; not available with device loopback capture) and **While streaming, play through** (off by default): makes the chosen output the default while streaming and switches back afterwards. Pick one with no speakers (a monitor without speakers, VB-CABLE) to keep this PC silent, also with device loopback capture.
 
 ### Command line: `nyxr`
 

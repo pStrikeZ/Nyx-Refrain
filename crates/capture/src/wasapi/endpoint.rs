@@ -188,6 +188,179 @@ impl EndpointMuteGuard {
     }
 }
 
+/// `IPolicyConfig`, the undocumented interface Windows' own sound settings use to set the
+/// default endpoint (also used by EarTrumpet and SoundSwitch). Only `SetDefaultEndpoint` is
+/// called; the methods before it just fill their vtable slots.
+#[allow(non_snake_case)]
+mod policy_config {
+    use windows::Win32::Media::Audio::{ERole, eConsole, eMultimedia};
+    use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
+    use windows::core::{HSTRING, PCWSTR};
+
+    #[windows::core::interface("f8679f50-850a-41cf-9c72-430f290290c8")]
+    unsafe trait IPolicyConfig: windows::core::IUnknown {
+        fn GetMixFormat(&self) -> windows::core::HRESULT;
+        fn GetDeviceFormat(&self) -> windows::core::HRESULT;
+        fn ResetDeviceFormat(&self) -> windows::core::HRESULT;
+        fn SetDeviceFormat(&self) -> windows::core::HRESULT;
+        fn GetProcessingPeriod(&self) -> windows::core::HRESULT;
+        fn SetProcessingPeriod(&self) -> windows::core::HRESULT;
+        fn GetShareMode(&self) -> windows::core::HRESULT;
+        fn SetShareMode(&self) -> windows::core::HRESULT;
+        fn GetPropertyValue(&self) -> windows::core::HRESULT;
+        fn SetPropertyValue(&self) -> windows::core::HRESULT;
+        fn SetDefaultEndpoint(&self, device_id: PCWSTR, role: ERole) -> windows::core::HRESULT;
+    }
+
+    const CLSID_POLICY_CONFIG_CLIENT: windows::core::GUID =
+        windows::core::GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
+
+    /// Makes the endpoint `id` the default output (console and multimedia roles).
+    pub(super) fn set_default_render_device(id: &str) -> windows::core::Result<()> {
+        let policy: IPolicyConfig =
+            unsafe { CoCreateInstance(&CLSID_POLICY_CONFIG_CLIENT, None, CLSCTX_ALL)? };
+        let id = HSTRING::from(id);
+        for role in [eConsole, eMultimedia] {
+            unsafe { policy.SetDefaultEndpoint(PCWSTR(id.as_ptr()), role).ok()? };
+        }
+        Ok(())
+    }
+}
+use policy_config::set_default_render_device;
+
+/// Whether the render endpoint `id` exists and is plugged in.
+fn is_active(id: &str) -> windows::core::Result<bool> {
+    let device = open_render_device(&DeviceSpec::ById(id.to_string()))?;
+    Ok(unsafe { device.GetState()? } == DEVICE_STATE_ACTIVE)
+}
+
+/// Whether the render endpoint `id` is the default output.
+fn is_default(id: &str) -> windows::core::Result<bool> {
+    Ok(get_device_id(&get_default_render_device()?)? == id)
+}
+
+/// Keeps another render endpoint the default output until dropped, then switches back to
+/// the one it replaced. Holds only endpoint IDs, so it can be dropped on any thread.
+pub struct DefaultOutputGuard {
+    target_id: String,
+    previous_id: String,
+    /// Cleared by [`Self::release`].
+    restore: bool,
+}
+
+impl DefaultOutputGuard {
+    /// Makes `target_id` the default output. Returns `None` if it already is.
+    pub fn switch_to(target_id: &str) -> windows::core::Result<Option<Self>> {
+        let _com = super::ComMtaGuard::new()?;
+        let previous_id = get_device_id(&get_default_render_device()?)?;
+        if previous_id == target_id {
+            return Ok(None);
+        }
+        if !is_active(target_id)? {
+            return Err(windows::core::Error::new(
+                windows::core::HRESULT(0x80070490u32 as i32), // ERROR_NOT_FOUND
+                "the output is not connected",
+            ));
+        }
+        set_default_render_device(target_id)?;
+        info!(from = %previous_id, to = %target_id, "Switched the default output");
+        Ok(Some(Self {
+            target_id: target_id.to_string(),
+            previous_id,
+            restore: true,
+        }))
+    }
+
+    /// Takes over a switch made by an earlier guard that was never dropped (the app exited
+    /// without switching back), so that dropping this one switches back.
+    pub fn adopt(target_id: String, previous_id: String) -> Self {
+        Self {
+            target_id,
+            previous_id,
+            restore: true,
+        }
+    }
+
+    /// Whether our output is still the default: the user may have picked another, or it was
+    /// unplugged. Assumed so if Windows can't say.
+    pub fn is_current(&self) -> bool {
+        let _com = super::ComMtaGuard::new();
+        is_default(&self.target_id).unwrap_or(true)
+    }
+
+    /// Whether our output is still plugged in. Assumed so if Windows can't say.
+    pub fn target_connected(&self) -> bool {
+        let _com = super::ComMtaGuard::new();
+        is_active(&self.target_id).unwrap_or(true)
+    }
+
+    /// The default output's endpoint ID, if Windows can say.
+    pub fn current_default() -> Option<String> {
+        let _com = super::ComMtaGuard::new().ok()?;
+        get_device_id(&get_default_render_device().ok()?).ok()
+    }
+
+    /// After a guard was dropped while `stopped_on_id` (a headset) was the default, instead of
+    /// `target_id`. Once that output is unplugged and Windows (or its app) falls back to
+    /// `target_id`, switches back to `previous_id`, the output `target_id` replaced. Returns
+    /// whether to stop watching: switched back, or the user moved on (picked another output,
+    /// or picked `target_id` by hand while the headset is still connected).
+    pub fn hand_back(
+        target_id: &str,
+        previous_id: &str,
+        stopped_on_id: &str,
+    ) -> windows::core::Result<bool> {
+        let _com = super::ComMtaGuard::new()?;
+        let default = get_device_id(&get_default_render_device()?)?;
+        if default == stopped_on_id {
+            return Ok(false);
+        }
+        if default != target_id || is_active(stopped_on_id)? || !is_active(previous_id)? {
+            return Ok(true);
+        }
+        set_default_render_device(previous_id)?;
+        info!(from = %target_id, to = %previous_id, "Switched the default output back");
+        Ok(true)
+    }
+
+    /// Drops the guard without switching back.
+    pub fn release(mut self) {
+        self.restore = false;
+    }
+
+    pub fn target_id(&self) -> &str {
+        &self.target_id
+    }
+
+    pub fn previous_id(&self) -> &str {
+        &self.previous_id
+    }
+}
+
+impl Drop for DefaultOutputGuard {
+    fn drop(&mut self) {
+        if !self.restore {
+            return;
+        }
+        let result = (|| -> windows::core::Result<bool> {
+            let _com = super::ComMtaGuard::new()?;
+            // The user picked another output meanwhile: keep their choice.
+            if !is_default(&self.target_id)? {
+                return Ok(false);
+            }
+            set_default_render_device(&self.previous_id)?;
+            Ok(true)
+        })();
+        match result {
+            Ok(true) => info!(to = %self.previous_id, "Switched the default output back"),
+            Ok(false) => info!("The default output was changed meanwhile; not switching back"),
+            Err(e) => {
+                warn!(to = %self.previous_id, "Failed to switch the default output back: {e}")
+            }
+        }
+    }
+}
+
 impl Drop for EndpointMuteGuard {
     fn drop(&mut self) {
         let result = (|| -> windows::core::Result<()> {

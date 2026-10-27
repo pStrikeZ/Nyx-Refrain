@@ -152,6 +152,8 @@ struct App {
     latency_restart_pending: bool,
     /// The flyout shows the settings page instead of the player.
     settings_open: bool,
+    /// This PC's outputs for the "play through" menu, and when they were listed.
+    outputs: Option<(Instant, Vec<capture::wasapi::DeviceInfo>)>,
 }
 
 impl App {
@@ -208,6 +210,7 @@ impl App {
             rounded_corners: false,
             latency_restart_pending: false,
             settings_open: false,
+            outputs: None,
         }
     }
 
@@ -256,7 +259,6 @@ impl App {
                     .is_some()
             },
         );
-
         ui.separator();
 
         let mut send_now_playing = settings.send_now_playing;
@@ -334,6 +336,65 @@ impl App {
             *settings_changed = true;
             self.engine.send(Cmd::SetMuteLocal(mute_local));
         }
+
+        let outputs = self.outputs().to_vec();
+        let current = match &settings.stream_output {
+            None => t(lang, Key::StreamOutputOff).to_string(),
+            Some(id) => outputs.iter().find(|o| &o.id == id).map_or_else(
+                || t(lang, Key::StreamOutputMissing).to_string(),
+                |o| o.friendly_name.clone(),
+            ),
+        };
+        let mut picked: Option<Option<String>> = None;
+        choice_row(
+            ui,
+            "stream_output_choice",
+            format!("{}: {current}", t(lang, Key::StreamOutput)),
+            |ui| {
+                if ui
+                    .selectable_label(
+                        settings.stream_output.is_none(),
+                        t(lang, Key::StreamOutputOff),
+                    )
+                    .clicked()
+                {
+                    picked = Some(None);
+                }
+                // Long output names are cut, in full on hover.
+                for o in &outputs {
+                    let on = settings.stream_output.as_ref() == Some(&o.id);
+                    if ui
+                        .add(egui::Button::selectable(on, &o.friendly_name).truncate())
+                        .on_hover_text(&o.friendly_name)
+                        .clicked()
+                    {
+                        picked = Some(Some(o.id.clone()));
+                    }
+                }
+                picked.is_some()
+            },
+        )
+        .on_hover_text(t(lang, Key::StreamOutputHint));
+        if let Some(id) = picked {
+            settings.stream_output = id.clone();
+            *settings_changed = true;
+            self.engine.send(Cmd::SetStreamOutput(id));
+        }
+    }
+
+    /// This PC's active outputs, listed again at most every 2 s (the menu asks every frame).
+    fn outputs(&mut self) -> &[capture::wasapi::DeviceInfo] {
+        if self
+            .outputs
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() > Duration::from_secs(2))
+        {
+            let list = capture::wasapi::ComMtaGuard::new()
+                .and_then(|_com| capture::wasapi::list_render_endpoints())
+                .unwrap_or_default();
+            self.outputs = Some((Instant::now(), list));
+        }
+        self.outputs.as_ref().map_or(&[], |(_, list)| list)
     }
 }
 
@@ -468,6 +529,16 @@ impl App {
                                 egui::RichText::new(engine_error_detail(lang, err))
                                     .size(11.0)
                                     .color(ERROR_COLOR),
+                            )
+                            .wrap(),
+                        );
+                    }
+                    if snap.output_missed && snap.state == State::Streaming {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(t(lang, Key::StreamOutputMissed))
+                                    .size(11.0)
+                                    .color(egui::Color32::from_rgb(0xe0, 0xa0, 0x30)),
                             )
                             .wrap(),
                         );
@@ -826,7 +897,7 @@ fn choice_row(
     id_salt: &str,
     title: String,
     list: impl FnOnce(&mut egui::Ui) -> bool,
-) {
+) -> egui::Response {
     let id = ui.make_persistent_id(id_salt);
     let mut state =
         egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
@@ -839,6 +910,7 @@ fn choice_row(
         state.set_open(!state.is_open() && !picked);
         state.store(ui.ctx());
     }
+    response.header_response
 }
 
 /// Small filled circle (painted, so it does not depend on the font having U+25CF).

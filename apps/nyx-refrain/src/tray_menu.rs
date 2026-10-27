@@ -87,6 +87,7 @@ pub fn build_start_params(
         remote_control: settings.remote_control,
         capture_mode: settings.capture_mode,
         mute_local: settings.mute_local,
+        stream_output: settings.stream_output.clone(),
     })
 }
 
