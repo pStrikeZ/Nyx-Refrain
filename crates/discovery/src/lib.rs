@@ -14,5 +14,6 @@ pub use cache::{DeviceCache, default_cache_path, default_config_dir};
 pub use device::DiscoveredDevice;
 pub use manual::{build_manual_target, parse_target_addr};
 pub use mdns::{
-    MDNS_MULTICAST_ADDR, MDNS_PORT, ParsedMdnsRecords, build_mdns_ptr_query, parse_mdns_response,
+    AIRPLAY_SERVICES, MDNS_MULTICAST_ADDR, MDNS_PORT, ParsedMdnsRecords, build_mdns_ptr_query,
+    parse_mdns_response,
 };
