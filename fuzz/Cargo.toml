@@ -1,0 +1,41 @@
+[package]
+name = "nyx-refrain-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+raop = { path = "../crates/raop" }
+discovery = { path = "../crates/discovery" }
+
+[[bin]]
+name = "rtsp_response"
+path = "fuzz_targets/rtsp_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control_packets"
+path = "fuzz_targets/control_packets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "timing_packets"
+path = "fuzz_targets/timing_packets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mdns_packet"
+path = "fuzz_targets/mdns_packet.rs"
+test = false
+doc = false
+bench = false
