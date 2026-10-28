@@ -14,8 +14,13 @@ pub const MDNS_MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 /// Standard mDNS UDP port (5353).
 pub const MDNS_PORT: u16 = 5353;
 
-/// Builds a DNS PTR query for the specified services.
-pub fn build_mdns_ptr_query(services: &[&str]) -> Vec<u8> {
+/// Services browsed for; PTR records of any other service are ignored (the 5353 listener
+/// sees all mDNS traffic on the LAN).
+pub const AIRPLAY_SERVICES: [&str; 2] = ["_raop._tcp.local", "_airplay._tcp.local"];
+
+/// Builds a DNS PTR query for the specified services. `unicast_response` sets the QU bit,
+/// asking responders to answer the querying socket directly.
+pub fn build_mdns_ptr_query(services: &[&str], unicast_response: bool) -> Vec<u8> {
     let mut buf = Vec::with_capacity(128);
 
     // 12-byte DNS Header
@@ -38,8 +43,9 @@ pub fn build_mdns_ptr_query(services: &[&str]) -> Vec<u8> {
 
         // QTYPE = 12 (PTR)
         buf.extend_from_slice(&12u16.to_be_bytes());
-        // QCLASS = 0x8001 (IN with unicast-response QU bit set)
-        buf.extend_from_slice(&0x8001u16.to_be_bytes());
+        // QCLASS = IN (1), with the unicast-response (QU) bit if asked for
+        let qclass: u16 = if unicast_response { 0x8001 } else { 0x0001 };
+        buf.extend_from_slice(&qclass.to_be_bytes());
     }
 
     buf
@@ -128,8 +134,15 @@ impl ParsedMdnsRecords {
             .unwrap_or_default()
             .as_secs();
 
-        // 1. Walk through all PTR records
-        for (_service, instance) in &self.ptrs {
+        // 1. Walk through the PTR records of the services browsed for
+        for (service, instance) in &self.ptrs {
+            let service = service.trim_end_matches('.');
+            if !AIRPLAY_SERVICES
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(service))
+            {
+                continue;
+            }
             let inst_clean = instance.trim_end_matches('.');
 
             // Find matching SRV
@@ -310,10 +323,14 @@ mod tests {
 
     #[test]
     fn test_build_mdns_query() {
-        let query = build_mdns_ptr_query(&["_raop._tcp.local", "_airplay._tcp.local"]);
+        let query = build_mdns_ptr_query(&AIRPLAY_SERVICES, true);
         assert!(query.len() > 12);
         // Header assertions: QDCOUNT = 2
         assert_eq!(query[4..6], 2u16.to_be_bytes());
+        // The last question's QCLASS carries the QU bit only when asked for.
+        assert_eq!(query[query.len() - 2..], 0x8001u16.to_be_bytes());
+        let query = build_mdns_ptr_query(&AIRPLAY_SERVICES, false);
+        assert_eq!(query[query.len() - 2..], 0x0001u16.to_be_bytes());
     }
 
     #[test]
@@ -342,6 +359,17 @@ mod tests {
             "AABBCCDDEEFF@Living Room._raop._tcp.local.".to_string(),
             (caps, raw),
         );
+
+        // Another service's records, seen by the 5353 listener, are not a receiver.
+        records.ptrs.push((
+            "_sftp-ssh._tcp.local.".to_string(),
+            "living-room._sftp-ssh._tcp.local.".to_string(),
+        ));
+        records.srvs.push((
+            "living-room._sftp-ssh._tcp.local.".to_string(),
+            "living-room.local.".to_string(),
+            22,
+        ));
 
         let devices = records.assemble_devices();
         assert_eq!(devices.len(), 1);

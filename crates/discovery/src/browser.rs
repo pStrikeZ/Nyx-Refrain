@@ -9,7 +9,8 @@ use tracing::{debug, info, warn};
 use crate::cache::DeviceCache;
 use crate::device::DiscoveredDevice;
 use crate::mdns::{
-    MDNS_MULTICAST_ADDR, MDNS_PORT, ParsedMdnsRecords, build_mdns_ptr_query, parse_mdns_response,
+    AIRPLAY_SERVICES, MDNS_MULTICAST_ADDR, MDNS_PORT, ParsedMdnsRecords, build_mdns_ptr_query,
+    parse_mdns_response,
 };
 
 #[derive(Debug, Error)]
@@ -98,7 +99,8 @@ fn query_socket(ip: Ipv4Addr) -> std::io::Result<std::net::UdpSocket> {
     Ok(s.into())
 }
 
-/// Best-effort listener on 5353 for responders that answer by multicast despite the QU bit.
+/// Best-effort listener on 5353 for multicast answers: to the standard query it sends, and
+/// from responders that answer by multicast despite the QU bit.
 fn multicast_listener(ifaces: &[(String, Ipv4Addr)]) -> std::io::Result<std::net::UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
@@ -109,6 +111,9 @@ fn multicast_listener(ifaces: &[(String, Ipv4Addr)]) -> std::io::Result<std::net
     for (_, ip) in ifaces {
         let _ = s.join_multicast_v4(&MDNS_MULTICAST_ADDR, ip);
     }
+    // It also sends the standard query (see discover_devices).
+    s.set_multicast_ttl_v4(255)?;
+    let _ = s.set_multicast_loop_v4(true);
     s.set_nonblocking(true)?;
     Ok(s.into())
 }
@@ -147,10 +152,17 @@ pub async fn discover_devices(
         return Err(DiscoveryError::NoUsableInterface);
     }
     let mut recv_sockets = query_sockets.clone();
-    match multicast_listener(&ifaces).and_then(UdpSocket::from_std) {
-        Ok(l) => recv_sockets.push(Arc::new(l)),
-        Err(e) => debug!("mDNS 5353 listener unavailable (continuing with unicast replies): {e}"),
-    }
+    let listener = match multicast_listener(&ifaces).and_then(UdpSocket::from_std) {
+        Ok(l) => {
+            let l = Arc::new(l);
+            recv_sockets.push(l.clone());
+            Some(l)
+        }
+        Err(e) => {
+            debug!("mDNS 5353 listener unavailable (continuing with unicast replies): {e}");
+            None
+        }
+    };
 
     let deadline = tokio::time::Instant::now() + options.timeout;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
@@ -176,10 +188,17 @@ pub async fn discover_devices(
     }
     drop(tx);
 
-    // Send the query on every interface, repeated for lossy Wi-Fi links.
-    let query_bytes = build_mdns_ptr_query(&["_raop._tcp.local", "_airplay._tcp.local"]);
+    // Send the query on every interface, repeated for lossy Wi-Fi links. From an ephemeral
+    // port it is a legacy unicast query (RFC 6762 6.7), which some responders (avahi) answer
+    // within 512 bytes, dropping the records that do not fit: a shairport-sync receiver's
+    // AirPlay 2 TXT record does not. So the 5353 listener also asks, as a standard query
+    // without the QU bit: the answers come by multicast, whole, and every socket on 5353
+    // gets them (a unicast reply to 5353 could go to another responder on this host).
+    let query_bytes = build_mdns_ptr_query(&AIRPLAY_SERVICES, true);
+    let multicast_query = build_mdns_ptr_query(&AIRPLAY_SERVICES, false);
     let mdns_dest = SocketAddr::V4(SocketAddrV4::new(MDNS_MULTICAST_ADDR, MDNS_PORT));
     let senders = query_sockets.clone();
+    let iface_ips: Vec<Ipv4Addr> = ifaces.iter().map(|(_, ip)| *ip).collect();
     let send_task = tokio::spawn(async move {
         for delay_ms in [0u64, 500, 1500] {
             tokio::time::sleep_until(tokio::time::Instant::now() + Duration::from_millis(delay_ms))
@@ -190,6 +209,17 @@ pub async fn discover_devices(
             for s in &senders {
                 if let Err(e) = s.send_to(&query_bytes, mdns_dest).await {
                     debug!("mDNS query send failed: {e}");
+                }
+            }
+            if let Some(ref l) = listener {
+                for ip in &iface_ips {
+                    let sent = match socket2::SockRef::from(l.as_ref()).set_multicast_if_v4(ip) {
+                        Ok(()) => l.send_to(&multicast_query, mdns_dest).await.map(|_| ()),
+                        Err(e) => Err(e),
+                    };
+                    if let Err(e) = sent {
+                        debug!("mDNS multicast query on {ip} failed: {e}");
+                    }
                 }
             }
         }
