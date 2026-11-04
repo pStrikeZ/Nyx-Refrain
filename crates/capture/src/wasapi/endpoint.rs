@@ -193,7 +193,7 @@ impl EndpointMuteGuard {
 /// called; the methods before it just fill their vtable slots.
 #[allow(non_snake_case)]
 mod policy_config {
-    use windows::Win32::Media::Audio::{ERole, eConsole, eMultimedia};
+    use windows::Win32::Media::Audio::{ERole, eCommunications, eConsole, eMultimedia};
     use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
     use windows::core::{HSTRING, PCWSTR};
 
@@ -215,12 +215,12 @@ mod policy_config {
     const CLSID_POLICY_CONFIG_CLIENT: windows::core::GUID =
         windows::core::GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
 
-    /// Makes the endpoint `id` the default output (console and multimedia roles).
+    /// Makes the endpoint `id` the default output for all render roles.
     pub(super) fn set_default_render_device(id: &str) -> windows::core::Result<()> {
         let policy: IPolicyConfig =
             unsafe { CoCreateInstance(&CLSID_POLICY_CONFIG_CLIENT, None, CLSCTX_ALL)? };
         let id = HSTRING::from(id);
-        for role in [eConsole, eMultimedia] {
+        for role in [eConsole, eMultimedia, eCommunications] {
             unsafe { policy.SetDefaultEndpoint(PCWSTR(id.as_ptr()), role).ok()? };
         }
         Ok(())
@@ -239,6 +239,31 @@ fn is_default(id: &str) -> windows::core::Result<bool> {
     Ok(get_device_id(&get_default_render_device()?)? == id)
 }
 
+/// Whether the endpoint `id` is the default for every render role.
+///
+/// A role may not have a default endpoint (for example, communications can be unset),
+/// so an inability to query any role is treated as not-default and lets the caller set it.
+fn are_all_roles_default(id: &str) -> bool {
+    use windows::Win32::Media::Audio::{eCommunications, eConsole, eMultimedia};
+
+    let Ok(enumerator) = create_device_enumerator() else {
+        return false;
+    };
+    for role in [eConsole, eMultimedia, eCommunications] {
+        let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, role) };
+        let Ok(device) = device else {
+            return false;
+        };
+        let Ok(default_id) = get_device_id(&device) else {
+            return false;
+        };
+        if default_id != id {
+            return false;
+        }
+    }
+    true
+}
+
 /// Keeps another render endpoint the default output until dropped, then switches back to
 /// the one it replaced. Holds only endpoint IDs, so it can be dropped on any thread.
 pub struct DefaultOutputGuard {
@@ -249,11 +274,11 @@ pub struct DefaultOutputGuard {
 }
 
 impl DefaultOutputGuard {
-    /// Makes `target_id` the default output. Returns `None` if it already is.
+    /// Makes `target_id` the default output for all render roles. Returns `None` if it already is.
     pub fn switch_to(target_id: &str) -> windows::core::Result<Option<Self>> {
         let _com = super::ComMtaGuard::new()?;
         let previous_id = get_device_id(&get_default_render_device()?)?;
-        if previous_id == target_id {
+        if are_all_roles_default(target_id) {
             return Ok(None);
         }
         if !is_active(target_id)? {
