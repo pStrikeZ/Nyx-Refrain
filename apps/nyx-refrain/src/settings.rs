@@ -74,7 +74,12 @@ pub enum CaptureMode {
 /// A default-output switch we made (see [`Settings::stream_output`]): endpoint IDs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwitchedOutput {
+    /// The default output we replaced (`to` itself if only the communications output was
+    /// switched).
     pub from: String,
+    /// The default communications output we replaced, if we switched it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_communications: Option<String>,
     pub to: String,
 }
 
@@ -185,6 +190,7 @@ mod tests {
             stream_output: Some("{0.0.0.00000000}.{acer}".into()),
             switched_output: Some(SwitchedOutput {
                 from: "{0.0.0.00000000}.{lg}".into(),
+                from_communications: Some("{0.0.0.00000000}.{headset}".into()),
                 to: "{0.0.0.00000000}.{acer}".into(),
             }),
             resume_on_launch: false,
