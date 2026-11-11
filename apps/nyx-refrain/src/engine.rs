@@ -374,10 +374,11 @@ type OutputSwitch = ();
 struct StreamOutput {
     #[cfg_attr(not(windows), allow(dead_code))]
     guard: Option<OutputSwitch>,
-    /// (ours, the output it replaced, the default then) when stopping found another output
-    /// the default (a headset turned on): if that output is later unplugged and Windows or
-    /// its app falls back to ours, we switch back once. See [`OutputSwitch::hand_back`].
-    handed_off: Option<(String, String, String)>,
+    /// (ours, the output it replaced, the communications output it replaced, the default
+    /// then) when stopping found another output the default (a headset turned on): if that
+    /// output is later unplugged and Windows or its app falls back to ours, we switch back
+    /// once. See [`OutputSwitch::hand_back`].
+    handed_off: Option<(String, String, Option<String>, String)>,
 }
 
 /// Makes `want` (an endpoint ID) the default output, or switches back to the output it
@@ -400,7 +401,11 @@ fn set_stream_output(
         if switch.guard.is_none()
             && let Some(left) = left
         {
-            switch.guard = Some(OutputSwitch::adopt(left.to, left.from));
+            switch.guard = Some(OutputSwitch::adopt(
+                left.to,
+                left.from,
+                left.from_communications,
+            ));
         }
         if want.is_some() {
             switch.handed_off = None;
@@ -409,7 +414,12 @@ fn set_stream_output(
             if !g.is_current()
                 && let Some(default) = OutputSwitch::current_default()
             {
-                switch.handed_off = Some((g.target_id().into(), g.previous_id().into(), default));
+                switch.handed_off = Some((
+                    g.target_id().into(),
+                    g.previous_id().into(),
+                    g.previous_communications_id().map(Into::into),
+                    default,
+                ));
             }
             drop(g);
         }
@@ -442,6 +452,7 @@ fn remember_switched_output(
 ) {
     let switched = switch.as_ref().map(|g| crate::settings::SwitchedOutput {
         from: g.previous_id().to_string(),
+        from_communications: g.previous_communications_id().map(Into::into),
         to: g.target_id().to_string(),
     });
     if let Some(s) = settings
@@ -479,8 +490,8 @@ fn output_switch_lost(
 /// Not streaming: see [`StreamOutput::handed_off`].
 fn hand_back_output(switch: &mut StreamOutput) {
     #[cfg(windows)]
-    if let Some((ours, theirs, stopped_on)) = &switch.handed_off {
-        match OutputSwitch::hand_back(ours, theirs, stopped_on) {
+    if let Some((ours, theirs, their_communications, stopped_on)) = &switch.handed_off {
+        match OutputSwitch::hand_back(ours, theirs, their_communications.as_deref(), stopped_on) {
             Ok(true) => switch.handed_off = None,
             Ok(false) => {}
             Err(e) => {

@@ -5,7 +5,8 @@ use tracing::{debug, info, warn};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::{
-    DEVICE_STATE_ACTIVE, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender,
+    DEVICE_STATE_ACTIVE, ERole, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
+    eCommunications, eConsole, eMultimedia, eRender,
 };
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree, STGM_READ};
 use windows::core::{HSTRING, PCWSTR};
@@ -193,7 +194,7 @@ impl EndpointMuteGuard {
 /// called; the methods before it just fill their vtable slots.
 #[allow(non_snake_case)]
 mod policy_config {
-    use windows::Win32::Media::Audio::{ERole, eConsole, eMultimedia};
+    use windows::Win32::Media::Audio::ERole;
     use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
     use windows::core::{HSTRING, PCWSTR};
 
@@ -215,12 +216,15 @@ mod policy_config {
     const CLSID_POLICY_CONFIG_CLIENT: windows::core::GUID =
         windows::core::GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
 
-    /// Makes the endpoint `id` the default output (console and multimedia roles).
-    pub(super) fn set_default_render_device(id: &str) -> windows::core::Result<()> {
+    /// Makes the endpoint `id` the default output for `roles`.
+    pub(super) fn set_default_render_device(
+        id: &str,
+        roles: &[ERole],
+    ) -> windows::core::Result<()> {
         let policy: IPolicyConfig =
             unsafe { CoCreateInstance(&CLSID_POLICY_CONFIG_CLIENT, None, CLSCTX_ALL)? };
         let id = HSTRING::from(id);
-        for role in [eConsole, eMultimedia] {
+        for &role in roles {
             unsafe { policy.SetDefaultEndpoint(PCWSTR(id.as_ptr()), role).ok()? };
         }
         Ok(())
@@ -239,21 +243,43 @@ fn is_default(id: &str) -> windows::core::Result<bool> {
     Ok(get_device_id(&get_default_render_device()?)? == id)
 }
 
-/// Keeps another render endpoint the default output until dropped, then switches back to
-/// the one it replaced. Holds only endpoint IDs, so it can be dropped on any thread.
+/// The roles of the default output: what plays unless an app picks an output itself.
+const OUTPUT_ROLES: [ERole; 2] = [eConsole, eMultimedia];
+/// The role of the default communications output (calls, voice chat). Windows keeps it apart
+/// from the default output, and it is often another endpoint (a headset).
+const COMMUNICATIONS_ROLES: [ERole; 1] = [eCommunications];
+
+/// The default communications output's endpoint ID, if there is one and Windows can say.
+fn default_communications_id() -> Option<String> {
+    let enumerator = create_device_enumerator().ok()?;
+    let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eCommunications) }.ok()?;
+    get_device_id(&device).ok()
+}
+
+/// Keeps another render endpoint the default output and the default communications output
+/// until dropped, then switches each back to the one it replaced. The two are remembered and
+/// switched back separately: either may already have been ours, or be changed by the user
+/// meanwhile. Holds only endpoint IDs, so it can be dropped on any thread.
 pub struct DefaultOutputGuard {
     target_id: String,
+    /// The default output we replaced; `target_id` itself if it already was the default
+    /// (only the communications output was switched).
     previous_id: String,
+    /// The default communications output we replaced; `None` if we left it alone (it already
+    /// was `target_id`, or Windows couldn't say what it was).
+    previous_communications_id: Option<String>,
     /// Cleared by [`Self::release`].
     restore: bool,
 }
 
 impl DefaultOutputGuard {
-    /// Makes `target_id` the default output. Returns `None` if it already is.
+    /// Makes `target_id` the default output and the default communications output. Returns
+    /// `None` if it already is both.
     pub fn switch_to(target_id: &str) -> windows::core::Result<Option<Self>> {
         let _com = super::ComMtaGuard::new()?;
         let previous_id = get_device_id(&get_default_render_device()?)?;
-        if previous_id == target_id {
+        let previous_communications_id = default_communications_id().filter(|id| id != target_id);
+        if previous_id == target_id && previous_communications_id.is_none() {
             return Ok(None);
         }
         if !is_active(target_id)? {
@@ -262,21 +288,41 @@ impl DefaultOutputGuard {
                 "the output is not connected",
             ));
         }
-        set_default_render_device(target_id)?;
-        info!(from = %previous_id, to = %target_id, "Switched the default output");
+        if previous_id != target_id {
+            set_default_render_device(target_id, &OUTPUT_ROLES)?;
+            info!(from = %previous_id, to = %target_id, "Switched the default output");
+        }
+        if let Some(previous) = &previous_communications_id {
+            // The default output is what matters; a failure here is not worth undoing it for.
+            match set_default_render_device(target_id, &COMMUNICATIONS_ROLES) {
+                Ok(()) => info!(
+                    from = %previous, to = %target_id,
+                    "Switched the default communications output"
+                ),
+                Err(e) => {
+                    warn!(to = %target_id, "Failed to switch the default communications output: {e}")
+                }
+            }
+        }
         Ok(Some(Self {
             target_id: target_id.to_string(),
             previous_id,
+            previous_communications_id,
             restore: true,
         }))
     }
 
     /// Takes over a switch made by an earlier guard that was never dropped (the app exited
     /// without switching back), so that dropping this one switches back.
-    pub fn adopt(target_id: String, previous_id: String) -> Self {
+    pub fn adopt(
+        target_id: String,
+        previous_id: String,
+        previous_communications_id: Option<String>,
+    ) -> Self {
         Self {
             target_id,
             previous_id,
+            previous_communications_id,
             restore: true,
         }
     }
@@ -304,10 +350,13 @@ impl DefaultOutputGuard {
     /// `target_id`. Once that output is unplugged and Windows (or its app) falls back to
     /// `target_id`, switches back to `previous_id`, the output `target_id` replaced. Returns
     /// whether to stop watching: switched back, or the user moved on (picked another output,
-    /// or picked `target_id` by hand while the headset is still connected).
+    /// or picked `target_id` by hand while the headset is still connected). The communications
+    /// output goes back to `previous_communications_id` with it, if it fell back to `target_id`
+    /// too.
     pub fn hand_back(
         target_id: &str,
         previous_id: &str,
+        previous_communications_id: Option<&str>,
         stopped_on_id: &str,
     ) -> windows::core::Result<bool> {
         let _com = super::ComMtaGuard::new()?;
@@ -318,8 +367,15 @@ impl DefaultOutputGuard {
         if default != target_id || is_active(stopped_on_id)? || !is_active(previous_id)? {
             return Ok(true);
         }
-        set_default_render_device(previous_id)?;
-        info!(from = %target_id, to = %previous_id, "Switched the default output back");
+        if previous_id != target_id {
+            set_default_render_device(previous_id, &OUTPUT_ROLES)?;
+            info!(from = %target_id, to = %previous_id, "Switched the default output back");
+        }
+        if let Some(previous) = previous_communications_id
+            && is_active(previous).unwrap_or(false)
+        {
+            restore_communications(target_id, previous);
+        }
         Ok(true)
     }
 
@@ -335,6 +391,26 @@ impl DefaultOutputGuard {
     pub fn previous_id(&self) -> &str {
         &self.previous_id
     }
+
+    pub fn previous_communications_id(&self) -> Option<&str> {
+        self.previous_communications_id.as_deref()
+    }
+}
+
+/// Switches the default communications output from `target_id` back to `previous_id`, unless
+/// it was changed meanwhile: then the user's choice stays.
+fn restore_communications(target_id: &str, previous_id: &str) {
+    if default_communications_id().as_deref() != Some(target_id) {
+        info!("The default communications output was changed meanwhile; not switching back");
+        return;
+    }
+    match set_default_render_device(previous_id, &COMMUNICATIONS_ROLES) {
+        Ok(()) => info!(to = %previous_id, "Switched the default communications output back"),
+        Err(e) => warn!(
+            to = %previous_id,
+            "Failed to switch the default communications output back: {e}"
+        ),
+    }
 }
 
 impl Drop for DefaultOutputGuard {
@@ -342,13 +418,23 @@ impl Drop for DefaultOutputGuard {
         if !self.restore {
             return;
         }
+        let Ok(_com) = super::ComMtaGuard::new() else {
+            warn!(to = %self.previous_id, "Failed to switch the default output back");
+            return;
+        };
+        if let Some(previous) = &self.previous_communications_id {
+            restore_communications(&self.target_id, previous);
+        }
+        // It already was the default output when we came: nothing to switch back.
+        if self.previous_id == self.target_id {
+            return;
+        }
         let result = (|| -> windows::core::Result<bool> {
-            let _com = super::ComMtaGuard::new()?;
             // The user picked another output meanwhile: keep their choice.
             if !is_default(&self.target_id)? {
                 return Ok(false);
             }
-            set_default_render_device(&self.previous_id)?;
+            set_default_render_device(&self.previous_id, &OUTPUT_ROLES)?;
             Ok(true)
         })();
         match result {
